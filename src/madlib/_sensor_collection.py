@@ -3,7 +3,7 @@
 
 from pathlib import Path
 from typing import List, Sequence
-
+from tqdm import tqdm
 import numpy as np
 import yaml
 from jsonschema import validate
@@ -14,7 +14,7 @@ from madlib._utils import MadlibException, sensor_yaml_schema
 
 from ._observation import ObservationCollection, combineObsCollections
 from ._satellite import Satellite
-from ._sensor import GroundOpticalSensor, _Sensor
+from ._sensor import GroundOpticalSensor, _Sensor, SpaceOpticalSensor
 
 
 class SensorException(Exception):
@@ -125,6 +125,14 @@ class SensorCollection:
         self.sensorList.append(sensor)
         self.numSensors = len(self.sensorList)
 
+    def propagate_sensors(self):
+        """Propagate all space-based sensors to their respective observation times
+        and record their positions and velocities.
+        """
+        space_sensor_list = [
+            s for s in self.sensorList if type(s) is SpaceOpticalSensor
+        ]
+
     def observe(self, target_satellite: Satellite) -> ObservationCollection:
         """Given a madlib.Satellite, generate an ObservationCollection
 
@@ -149,7 +157,7 @@ class SensorCollection:
         else:
             obsCollections: List[ObservationCollection] = [
                 sensor.observe(target_satellite, obstimes)
-                for sensor, obstimes in zip(self.sensorList, self.obsTimes)
+                for sensor, obstimes in tqdm(zip(self.sensorList, self.obsTimes))
             ]
             observations: ObservationCollection = combineObsCollections(obsCollections)
 

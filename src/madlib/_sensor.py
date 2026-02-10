@@ -42,12 +42,12 @@ class _Sensor(Protocol):
         raise NotImplementedError
 
     @abstractmethod
-    def observe(self, sat: Satellite, times: float | NDArray[np.float64]):
+    def observe(self, target_satellite: Satellite, times: float | NDArray[np.float64]):
         """Observe a given satellite with this sensor at the times given.
 
         Parameters
         ----------
-        sat : Satellite
+        target_satellite : Satellite
             Satellite object to observe
         times : float | NDArray[np.float64]
             Time(s) to observe the satellite. Specified as MJD in the UTC system.
@@ -158,62 +158,74 @@ class _OpticalSensor(_Sensor):
         ValueError
             Start timestamp must be before end timestamp
         """
-
         if start >= end:
             raise ValueError(f"start ({start}) must be before end ({end})")
 
         def gap_gen() -> float:
             return self.collect_gap_mean + self.collect_gap_std * np.random.randn()
 
-        istuple = isinstance(self.obs_per_collect, (tuple, list))
-
-        def nobs_gen() -> int:
-            if istuple:
-                return np.random.randint(
-                    self.obs_per_collect[0], self.obs_per_collect[1] + 1  # type: ignore
-                )
-            else:
-                return self.obs_per_collect  # type: ignore
-
         # --- generate collect times
-        collect_times = []
-        latest = start
-        first = True
-        while latest < end:
-            # generate a gap time at random
-            gap = gap_gen() / 86400
 
-            # if this is the first gap, randomly scale it between 0-1
-            # (otherwise the first observation will be biased late)
-            if first:
-                gap *= np.random.rand()
-                first = False
+        # Make an overly careful ballpark estimate for the number of collections
+        num_collect = int(1.5 * (end - start) * 86400 / self.collect_gap_mean)
+        gap_times = self.collect_gap_mean + self.collect_gap_std * np.random.randn(
+            num_collect
+        )
 
-            # add the gap time to the latest collect time, and append to the
-            # list if it isn't too late
-            latest += gap
-            if latest < end:
-                collect_times.append(latest)
+        # The first gap will be uniformly randomly scaled between 0-1
+        # (otherwise the first observation will be biased late)
+        gap_times[0] = gap_times[0] * np.random.rand()
+
+        # Compute collect times
+        collect_times = start + np.cumsum(gap_times) / 86400
+
+        # Add more gaps if needed
+        while collect_times[-1] < end:
+            new_gap_times = (
+                self.collect_gap_mean
+                + self.collect_gap_std * np.random.randn(num_collect)
+            )
+            new_collect_times = collect_times[-1] + np.cumsum(new_gap_times)
+            collect_times = np.append(collect_times, new_collect_times)
+
+        collect_times = collect_times[collect_times < end]
 
         # --- generate observation times within each collect
-        obs_times = []
-        for coll in collect_times:
-            # generate a (possibly) random number of observations in this collect
-            nobs = nobs_gen()
 
-            # compute the time of each observation given the collect start time
-            times = coll + (np.arange(nobs) * self.obs_time_spacing) / 86400
+        # If the number of obs per gen is a random integer between two limits, pre-compute those numbers
+        if isinstance(self.obs_per_collect, (tuple, list)):
+            nobs_array = np.random.randint(
+                self.obs_per_collect[0],
+                self.obs_per_collect[1] + 1,
+                size=len(collect_times),
+            )
+            # Use this array to create a mask array of size (C,O) where C
+            # is the number of collects and O is the maximum allowed obs per collect
+            obs_range = np.arange(0, self.obs_per_collect[1])
+            max_obs = np.tile(obs_range, (len(collect_times), 1))
 
-            # handle edge effect at the end of the observing period
-            # all observations in this collect must be before the end, otherwise
-            # none are saved
-            if (times < end).all():
-                obs_times.append(times)
+            mask = max_obs < nobs_array.reshape(-1, 1)
 
-        if len(obs_times) > 0:
-            obs_times = np.hstack(obs_times)
+            # Compute the time of each observation given the collect start time
+            # (this includes observations beyond a given collect size)
+            obs_times = collect_times.reshape(-1, 1) + max_obs * (
+                self.obs_time_spacing / 86400
+            )
+
+            # Remove observations beyond collect sizes with the mask
+            obs_times = obs_times[mask]
+
+        # If the number of obs per collection is fixed, we can simplify the computation
         else:
-            obs_times = np.array([])
+            obs_range = np.arange(0, self.obs_per_collect)
+            max_obs = np.tile(obs_range, (len(collect_times), 1))
+            obs_times = collect_times.reshape(-1, 1) + max_obs * (
+                self.obs_time_spacing / 86400
+            )
+            obs_times = obs_times.flatten()
+
+        obs_times = obs_times[obs_times < end]
+
         return obs_times
 
     def validate_limits(self, obs: Observation) -> bool:
@@ -437,12 +449,21 @@ class GroundOpticalSensor(_OpticalSensor):
                 pos_expected=pos_expected,
             )
 
-        # Propagate satellite to the desired times, with and without maneuvers
-        x_target, v_target = target_satellite.propagate(times, use_true_orbit=True)
-        x_target_expected, v_target_expected = target_satellite.propagate(
-            times,
-            ignore_maneuvers=True,
-        )
+        # If the target satellite has been pre-propagated, interpolate pos/vel values
+        # from its ephemeris.
+        if target_satellite.pre_prop_flag:
+            x_target, v_target = target_satellite.interp_from_pre_propagate(
+                times, use_true_orbit=True
+            )
+            x_target_expected, v_target_expected = (
+                target_satellite.interp_from_pre_propagate(times, use_true_orbit=False)
+            )
+        # If target satellite is not pre-propagatedropagate satellite's true and expected orbits to the desired times
+        else:
+            x_target, v_target = target_satellite.propagate(times, use_true_orbit=True)
+            x_target_expected, v_target_expected = target_satellite.propagate(
+                times, ignore_maneuvers=True
+            )
 
         # Coordinate conversion to observables
         # (observables for an optical sensor are RA/Dec)
@@ -724,6 +745,55 @@ class SpaceOpticalSensor(_OpticalSensor):
         self.sensor_satellite = sensor_satellite
         self.sensor_satellite_truth = sensor_satellite_truth
 
+        # The trajectory of the sensor satellite will be None until it is propagated along a time series.
+        # The true trajectory and the reported trajectory can differ if <sensor_satellite_truth> is not None.
+        self.sensor_propagated = False
+        self.x_sensor_reported = None
+        self.v_sensor_reported = None
+        self.x_sensor_truth = None
+        self.v_sensor_truth = None
+
+    def sensor_propagate(
+        self,
+        times: float | NDArray[np.float64] | Tuple[float, float],
+    ):
+        """Propagate the sensor satellite to each point in a time series,
+        recording the sensor's true and reported position and velocity at each point.
+
+        Parameters
+        ----------
+        times : float | NDArray[np.float64] | Tuple[float, float]
+            Time(s) at which the satellite's pos/vel will be recorded. Specified as MJD in the UTC system.
+                - If a single float is given, a record will be made at just that time.
+                - If a numpy array is given, records will be made at each time in the array.
+                - If a tuple of two floats is given, they will represent the start and end
+                  of recording, and record times will be generated accordingly
+        """
+        # Handle scalar and tuple time inputs
+        if isinstance(times, (float, int)):
+            times = np.asarray([times])
+
+        if isinstance(times, tuple):
+            start_mjd = min(times)
+            end_mjd = max(times)
+            times = self.generate_obs_timing(start_mjd, end_mjd)
+
+        # Propagate sensor expected position to the desired times
+        self.x_sensor_reported, self.v_sensor_reported = (
+            self.sensor_satellite.propagate(times)
+        )
+
+        # If a true orbit has been given, propagate it as well
+        if self.sensor_satellite_truth is not None:
+            self.x_sensor_truth, self.v_sensor_truth = (
+                self.sensor_satellite_truth.propagate(times)
+            )
+        else:
+            self.x_sensor_truth = self.x_sensor_reported
+            self.v_sensor_truth = self.v_sensor_reported
+
+        self.sensor_propagated = True
+
     def observe(
         self,
         target_satellite: Satellite,
@@ -760,6 +830,9 @@ class SpaceOpticalSensor(_OpticalSensor):
             given the sensor noise parameters and the "true" observation that
             excludes all noise sources.
         """
+        import time
+
+        t0 = time.time()
 
         # Handle scalar and tuple time inputs
         if isinstance(times, (float, int)):
@@ -784,30 +857,43 @@ class SpaceOpticalSensor(_OpticalSensor):
                 pos_expected=pos_expected,
             )
 
+        t1 = time.time()
+
         # Propagate sensor expected position to the desired times
-        x_sensor_reported, v_sensor_reported = self.sensor_satellite.propagate(times)
+        if not self.sensor_propagated:
+            self.sensor_propagate(times)
 
-        # If a true orbit has been given, propagate it as well
-        if self.sensor_satellite_truth is not None:
-            x_sensor_truth, v_sensor_truth = self.sensor_satellite_truth.propagate(
-                times
+        assert self.x_sensor_truth is not None
+        assert self.v_sensor_truth is not None
+        assert self.x_sensor_reported is not None
+        assert self.v_sensor_reported is not None
+
+        t2 = time.time()
+
+        # If the target satellite has been pre-propagated, interpolate pos/vel values
+        # from its ephemeris.
+        if target_satellite.pre_prop_flag:
+            x_target, v_target = target_satellite.interp_from_pre_propagate(
+                times, use_true_orbit=True
             )
+            x_target_expected, v_target_expected = (
+                target_satellite.interp_from_pre_propagate(times, use_true_orbit=False)
+            )
+        # If target satellite is not pre-propagatedropagate satellite's true and expected orbits to the desired times
         else:
-            x_sensor_truth = x_sensor_reported
-            v_sensor_truth = v_sensor_reported
+            x_target, v_target = target_satellite.propagate(times, use_true_orbit=True)
+            x_target_expected, v_target_expected = target_satellite.propagate(
+                times, ignore_maneuvers=True
+            )
 
-        # Propagate satellite's true and expected orbits to the desired times
-        x_target, v_target = target_satellite.propagate(times, use_true_orbit=True)
-        x_target_expected, v_target_expected = target_satellite.propagate(
-            times, ignore_maneuvers=True
-        )
+        t3 = time.time()
 
         # Compute true and expected RA/Dec, range, and range_rate
         (fp_state_truth, r_truth, r_rate_truth) = afc.PosVelToFPState(
             x_target,
             v_target,
-            x_sensor_truth,
-            v_sensor_truth,
+            self.x_sensor_truth,
+            self.v_sensor_truth,
         )
         ra_truth = fp_state_truth[:, 0] * 180 / np.pi
         dec_truth = fp_state_truth[:, 1] * 180 / np.pi
@@ -815,18 +901,20 @@ class SpaceOpticalSensor(_OpticalSensor):
         (fp_state_expected, r_expected, r_rate_expected) = afc.PosVelToFPState(
             x_target_expected,
             v_target_expected,
-            x_sensor_reported,
-            v_sensor_reported,
+            self.x_sensor_reported,
+            self.v_sensor_reported,
         )
         ra_expected = fp_state_expected[:, 0] * 180 / np.pi
         dec_expected = fp_state_expected[:, 1] * 180 / np.pi
+
+        t4 = time.time()
 
         # Compute solar separation angle at observation times
         # (using the sensor's true orbit)
         x_sun = np.array([R_sun(_t) for _t in times])
         sun_angle_deg = calc_separation_angle(
-            x_sun - x_sensor_truth,
-            x_target - x_sensor_truth,
+            x_sun - self.x_sensor_truth,
+            x_target - self.x_sensor_truth,
             in_deg=True,
         )
 
@@ -857,6 +945,8 @@ class SpaceOpticalSensor(_OpticalSensor):
             ]
         )
 
+        t5 = time.time()
+
         ### Actual/Observed Measurements
 
         # Apply misattributed observations, if requested
@@ -865,7 +955,7 @@ class SpaceOpticalSensor(_OpticalSensor):
 
             # Compute (observed) RA/Dec, range, and range_rate
             (fp_state_obs, r_obs, r_rate_obs) = afc.PosVelToFPState(
-                x_target, v_target, x_sensor_truth, v_sensor_truth
+                x_target, v_target, self.x_sensor_truth, self.v_sensor_truth
             )
             ra_measured = fp_state_obs[:, 0] * 180 / np.pi
             dec_measured = fp_state_obs[:, 1] * 180 / np.pi
@@ -898,15 +988,17 @@ class SpaceOpticalSensor(_OpticalSensor):
             ]
         )
 
+        t6 = time.time()
+
         # Remove observations that are not within the sensor limits
 
         ## Any viewing vector that is obscured by Earth is not valid
-        sensor_dist = np.linalg.norm(x_sensor_truth, axis=1)
-        viewing_vector = x_target - x_sensor_truth
+        sensor_dist = np.linalg.norm(self.x_sensor_truth, axis=1)
+        viewing_vector = x_target - self.x_sensor_truth
         ### Calculate the angle from center of Earth, to sensor, to target.
         ### Note: If this angle is obtuse, it is automatically valid.
         viewing_angle = np.pi - np.abs(
-            calc_separation_angle(x_sensor_truth, viewing_vector)
+            calc_separation_angle(self.x_sensor_truth, viewing_vector)
         )
         ### Calculate minimum height above Earth for viewing vector
         min_view_height = sensor_dist * np.sin(viewing_angle)
@@ -923,6 +1015,12 @@ class SpaceOpticalSensor(_OpticalSensor):
             pos_observed=obs_measured,
             pos_truth=obs_truth,
             pos_expected=obs_expected,
+        )
+
+        t7 = time.time()
+
+        print(
+            f"Timing: {t1-t0:.2f}, {t2-t1:.2f}, {t3-t2:.2f}, {t4-t3:.2f}, {t5-t4:.2f}, {t6-t5:.2f}, {t7-t6:.2f}"
         )
 
         return observations

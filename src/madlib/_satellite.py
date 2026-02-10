@@ -134,6 +134,9 @@ class Satellite:
         if len(kwargs.items()) != 0:
             raise NotImplementedError("kwargs are not yet supported")
 
+        # Flag if this satellite has a pre-computed ephemeris
+        self.pre_prop_flag = False
+
     @property
     def does_maneuver(self) -> bool:
         return self._maneuver is not None
@@ -352,6 +355,114 @@ class Satellite:
             V = np.vstack(Vkeep)
 
             return X, V
+
+    def pre_propagate(
+        self,
+        start_mjd: float,
+        end_mjd: float,
+        timestep_sec: float,
+    ):
+        """Propagate the satellite along an even grid of times, then save the
+        pos/vel time series as attributes.
+
+        Parameters
+        ----------
+        start_mjd : float
+            Initial timestamp (MJD, UTC)
+        end_mjd : float
+            Timestamp at which propagation ends (MJD, UTC)
+        timestep_sec : float
+            Number of seconds in between each timestep
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            One of the propagation times is the exact same time as the maneuver.
+        """
+        self.pre_prop_t = np.arange(start_mjd, end_mjd, timestep_sec / 86400.0)
+
+        # Propagate the satellite's true orbit
+        self.pre_prop_X, self.pre_prop_V = self.propagate(
+            times=self.pre_prop_t,
+            use_true_orbit=True,
+        )
+
+        # Propagate the satellite's expected orbit
+        self.pre_prop_exp_X, self.pre_prop_exp_V = self.propagate(
+            times=self.pre_prop_t,
+            ignore_maneuvers=True,
+        )
+
+        self.pre_prop_flag = True
+
+    def interp_from_pre_propagate(
+        self,
+        times: float | NDArray[np.float64],
+        use_true_orbit: bool,
+    ):
+        """Given an array of time values (MJD), interpolate from the satellite's
+        pre-propagated ephemeris to find the corresponding pos/vel values.
+
+        Parameters
+        ----------
+        times : float | NDArray[np.float64])
+            Timestamp(s) for evaluating the satellite propagation (MJD, UTC)
+        use_true_orbit : bool
+            If True, use the satellite's true orbit for interpolations; if False,
+            use the expected orbit (no maneuvers; includes reporting bias)
+
+        Returns
+        -------
+        tuple[NDArray[np.float64], NDArray[np.float64]]
+            First element of tuple is X : (N,3), position vector(s) at the time(s)
+            requested. Coordinate system is TETED. Units are km.
+            Second element of tuple is V : (N,3), velocity vector(s) at the time(s)
+            requested, Coordinate system is TETED. Units are km/s.
+
+
+        Raises
+        ------
+        MadlibException
+            Satellite object has not been pre-propagated (see pre_propagate function)
+        MadlibException
+            One or more of the interpolation time values is outside the pre-propagation time rangeß
+        """
+        if not self.pre_prop_flag:
+            raise MadlibException(
+                "Cannot interpolate ephemeris values: Satellite has not been pre-propagated"
+            )
+
+        if isinstance(times, (float, int)):
+            times = np.asarray([times])
+
+        if min(times) < self.pre_prop_t[0] or max(times) > self.pre_prop_t[-1]:
+            raise MadlibException(
+                "Interpolation time range exceeds pre-propagation time range."
+            )
+
+        if use_true_orbit:
+            orbit_x = self.pre_prop_X
+            orbit_v = self.pre_prop_V
+        else:
+            orbit_x = self.pre_prop_exp_X
+            orbit_v = self.pre_prop_exp_V
+
+        pos_x = np.interp(times, self.pre_prop_t, orbit_x[:, 0]).reshape((-1, 1))
+        pos_y = np.interp(times, self.pre_prop_t, orbit_x[:, 1]).reshape((-1, 1))
+        pos_z = np.interp(times, self.pre_prop_t, orbit_x[:, 2]).reshape((-1, 1))
+
+        vel_x = np.interp(times, self.pre_prop_t, orbit_v[:, 0]).reshape((-1, 1))
+        vel_y = np.interp(times, self.pre_prop_t, orbit_v[:, 1]).reshape((-1, 1))
+        vel_z = np.interp(times, self.pre_prop_t, orbit_v[:, 2]).reshape((-1, 1))
+
+        X = np.hstack((pos_x, pos_y, pos_z))
+        V = np.hstack((vel_x, vel_y, vel_z))
+
+        return X, V
 
     def create_cross_tag(
         self,
